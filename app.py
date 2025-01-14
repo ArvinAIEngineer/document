@@ -20,7 +20,7 @@ NEON_DB_NAME = os.getenv("NEON_DB_NAME")
 
 # GPT-4 Vision setup
 os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-MODEL = "gpt-4-vision-preview"
+MODEL = "gpt-4o-mini"
 
 async def connect_to_neon():
     """Create database connection"""
