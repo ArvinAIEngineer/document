@@ -1,8 +1,8 @@
 streamlit
-asyncio
 asyncpg
 python-dotenv
-nanonets
+ocr-nanonets-wrapper
 groq
-fuzzywuzzy[speedup]
-PyPDF2
+fuzzywuzzy
+python-Levenshtein
+asyncio
