@@ -4,5 +4,5 @@ asyncpg
 python-dotenv
 nanonets
 groq
-fuzzywuzzy
+fuzzywuzzy[speedup]
 PyPDF2
