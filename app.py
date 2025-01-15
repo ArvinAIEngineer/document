@@ -1,55 +1,45 @@
-import streamlit as st
-from pyzerox import zerox
 import os
+import streamlit as st
 import asyncio
 import asyncpg
-import logging
 from dotenv import load_dotenv
+from nanonets import NANONETSOCR
+from groq import Groq
 import json
-from typing import Dict, Tuple
+from typing import Dict, Optional
+from fuzzywuzzy import fuzz
 
 # Load environment variables
 load_dotenv()
 
-# Neon DB connection parameters
+# Configuration
 NEON_DB_USER = os.getenv("NEON_DB_USER")
 NEON_DB_PASSWORD = os.getenv("NEON_DB_PASSWORD")
 NEON_DB_HOST = os.getenv("NEON_DB_HOST")
 NEON_DB_PORT = os.getenv("NEON_DB_PORT")
 NEON_DB_NAME = os.getenv("NEON_DB_NAME")
+NANONETS_API_KEY = os.getenv("NANONETS_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# GPT-4 Vision setup
-os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
-MODEL = "gpt-4o-mini"
+# Initialize OCR and LLM
+model = NANONETSOCR()
+model.set_token(NANONETS_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
+# Ensure temp directory exists
+os.makedirs("temp", exist_ok=True)
+
+# Database functions
 async def connect_to_neon():
-    """Create database connection"""
-    conn = await asyncpg.connect(
+    return await asyncpg.connect(
         user=NEON_DB_USER,
         password=NEON_DB_PASSWORD,
         database=NEON_DB_NAME,
         host=NEON_DB_HOST,
         port=NEON_DB_PORT
     )
-    return conn
-
-async def setup_database():
-    """Create necessary database tables"""
-    conn = await connect_to_neon()
-    try:
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS accounts (
-                username TEXT PRIMARY KEY,
-                photo_verification TEXT,
-                doc_verification TEXT,
-                extracted_data JSONB
-            )
-        ''')
-    finally:
-        await conn.close()
 
 async def user_exists(username: str) -> bool:
-    """Check if user exists in database"""
     conn = await connect_to_neon()
     try:
         result = await conn.fetch('SELECT COUNT(*) FROM accounts WHERE username = $1', username)
@@ -58,145 +48,243 @@ async def user_exists(username: str) -> bool:
         await conn.close()
 
 async def create_new_user(username: str):
-    """Create new user in database"""
     conn = await connect_to_neon()
     try:
         await conn.execute(
-            'INSERT INTO accounts (username, photo_verification, doc_verification, extracted_data) VALUES ($1, $2, $3, $4)',
-            username, None, None, '{}'
+            'INSERT INTO accounts (username, doc_verification) VALUES ($1, $2)',
+            username, None
         )
-    except Exception as e:
-        logging.error(f"Error creating new user {username}: {e}")
     finally:
         await conn.close()
 
-async def update_verification_result(username: str, verification_status: str, extracted_data: Dict):
-    """Update verification results in database"""
+async def update_verification_status(username: str, status: str):
     conn = await connect_to_neon()
     try:
         await conn.execute(
-            'UPDATE accounts SET doc_verification = $1, extracted_data = $2 WHERE username = $3',
-            verification_status, json.dumps(extracted_data), username
+            'UPDATE accounts SET doc_verification = $1 WHERE username = $2',
+            status, username
         )
-    except Exception as e:
-        logging.error(f"Error updating verification result for {username}: {e}")
     finally:
         await conn.close()
 
-async def extract_document_info(file_path: str) -> Dict:
-    """Extract information from document using py-zerox"""
-    custom_system_prompt = """
-    Extract the following information from the document:
-    - Name
-    - Address
-    - Phone Number
-    
-    Return the information in a JSON format with these exact keys: name, address, phone_number
-    If any information is not found, set the value as null.
+def save_uploaded_file(uploaded_file) -> str:
+    """Save uploaded file to temp directory and return the path"""
+    file_path = os.path.join("temp", uploaded_file.name)
+    with open(file_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return file_path
+
+def get_extraction_prompt(doc_type: str, text: str) -> str:
+    """Generate appropriate prompt based on document type"""
+    base_prompt = """
+    Extract the following information from the text below and return it as a JSON object:
+    - name: The full name of the person
+    - phone: The phone number (if present)
+    - address: The complete address
+
+    Text: {text}
+
+    Important: Look carefully through the entire text for these details. They might appear anywhere in the document.
+    The name might be preceded by terms like "Name:", "Customer Name:", etc.
+    The address might be preceded by "Address:", "Residence:", "Location:", etc.
+    Phone numbers might be in various formats including +91 prefix or 10 digits.
+
+    Return only the JSON object in this format:
+    {{
+        "name": "extracted name or null",
+        "phone": "extracted phone or null",
+        "address": "extracted address or null"
+    }}
     """
     
+    if doc_type == "id":
+        base_prompt += "\nNote: This is an ID document. Look for officially stated name and address."
+    elif doc_type == "bank":
+        base_prompt += "\nNote: This is a bank statement. Look for account holder details and registered address."
+    
+    return base_prompt.format(text=text)
+
+def extract_entities_using_groq(text: str, doc_type: str) -> Dict[str, Optional[str]]:
+    """Extract entities from text using Groq's language model"""
+    prompt = get_extraction_prompt(doc_type, text)
+
     try:
-        result = await zerox(
-            file_path=file_path,
-            model=MODEL,
-            custom_system_prompt=custom_system_prompt
+        response = groq_client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="mixtral-8x7b-32768",
+            temperature=0.1,
+            max_tokens=500,
         )
         
-        # Parse the markdown result into JSON
-        # Note: You might need to adjust this parsing based on actual output format
-        extracted_info = json.loads(result)
-        return extracted_info
+        # Log the raw text and extracted information for debugging
+        print(f"\nProcessing {doc_type.upper()} document")
+        print("Raw OCR text:", text[:500] + "..." if len(text) > 500 else text)
+        print("Groq response:", response.choices[0].message.content)
+        
+        # Parse the response into a dictionary
+        extracted_info = json.loads(response.choices[0].message.content)
+        return {
+            'name': extracted_info.get('name'),
+            'phone': extracted_info.get('phone'),
+            'address': extracted_info.get('address')
+        }
     except Exception as e:
-        logging.error(f"Error extracting document info: {e}")
-        return {"name": None, "address": None, "phone_number": None}
+        print(f"Error processing {doc_type} document:", str(e))
+        return {'name': None, 'phone': None, 'address': None}
 
-def compare_extracted_info(id_info: Dict, bank_info: Dict) -> Tuple[bool, str]:
-    """Compare extracted information from both documents"""
+def process_document(file_path: str, doc_type: str) -> Dict[str, Optional[str]]:
+    """Process document using OCR and Groq for entity extraction"""
+    try:
+        # Get OCR text
+        text = model.convert_to_string(file_path, formatting='lines')
+        
+        # Extract entities using Groq
+        return extract_entities_using_groq(text, doc_type)
+    except Exception as e:
+        print(f"Error in document processing: {str(e)}")
+        return {'name': None, 'phone': None, 'address': None}
+
+def compare_with_fuzzy_match(str1: str, str2: str, threshold: int = 80) -> bool:
+    """Compare two strings using fuzzy matching"""
+    if not str1 or not str2:
+        return False
+    
+    # Clean the strings
+    str1 = str1.lower().strip()
+    str2 = str2.lower().strip()
+    
+    # Get the ratio
+    ratio = fuzz.ratio(str1, str2)
+    token_sort_ratio = fuzz.token_sort_ratio(str1, str2)
+    
+    # Use the higher of the two scores
+    similarity = max(ratio, token_sort_ratio)
+    
+    return similarity >= threshold
+
+def compare_phone_numbers(phone1: str, phone2: str) -> bool:
+    """Compare phone numbers by removing all non-digits"""
+    if not phone1 or not phone2:
+        return False
+    
+    # Remove all non-digits
+    phone1 = ''.join(filter(str.isdigit, phone1))
+    phone2 = ''.join(filter(str.isdigit, phone2))
+    
+    # If both are empty after cleaning, return False
+    if not phone1 or not phone2:
+        return False
+    
+    # Compare the last 10 digits if longer
+    phone1 = phone1[-10:] if len(phone1) >= 10 else phone1
+    phone2 = phone2[-10:] if len(phone2) >= 10 else phone2
+    
+    return phone1 == phone2
+
+def compare_extracted_info(id_info: Dict, bank_info: Dict) -> tuple:
+    """Compare extracted information from both documents using fuzzy matching"""
     matches = []
     mismatches = []
+    match_details = {}
     
-    for field in ['name', 'address', 'phone_number']:
-        if id_info.get(field) and bank_info.get(field):
-            if id_info[field].lower() == bank_info[field].lower():
-                matches.append(field)
-            else:
-                mismatches.append(field)
+    # Compare each field
+    if id_info['name'] and bank_info['name']:
+        name_match = compare_with_fuzzy_match(id_info['name'], bank_info['name'])
+        if name_match:
+            matches.append('name')
+            match_details['name'] = "Matched with high confidence"
+        else:
+            mismatches.append('name')
+            match_details['name'] = "Names differ significantly"
     
-    # Verification passes if at least 2 fields match and there are no mismatches
-    is_verified = len(matches) >= 2 and len(mismatches) == 0
+    if id_info['phone'] and bank_info['phone']:
+        phone_match = compare_phone_numbers(id_info['phone'], bank_info['phone'])
+        if phone_match:
+            matches.append('phone')
+            match_details['phone'] = "Phone numbers match"
+        else:
+            mismatches.append('phone')
+            match_details['phone'] = "Phone numbers differ"
     
-    status_message = f"Matched fields: {', '.join(matches)}\n"
-    if mismatches:
-        status_message += f"Mismatched fields: {', '.join(mismatches)}"
+    if id_info['address'] and bank_info['address']:
+        address_match = compare_with_fuzzy_match(id_info['address'], bank_info['address'], threshold=80)
+        if address_match:
+            matches.append('address')
+            match_details['address'] = "Addresses match with high similarity"
+        else:
+            mismatches.append('address')
+            match_details['address'] = "Addresses differ significantly"
     
-    return is_verified, status_message
+    # Consider verified if at least 2 fields match
+    is_verified = len(matches) >= 2
+    return is_verified, matches, mismatches, match_details
 
 def main():
-    st.title("Document Verification System")
     
-    # Initialize database
-    asyncio.run(setup_database())
-    
-    # Get username
     username = st.text_input("Enter your username:")
+    
     if username:
-        # Check if user exists
-        user_exists_in_db = asyncio.run(user_exists(username))
-        if not user_exists_in_db:
-            st.info("Username not found. Creating a new user...")
+        user_exists_result = asyncio.run(user_exists(username))
+        if not user_exists_result:
             asyncio.run(create_new_user(username))
             st.success(f"New user '{username}' created.")
         
-        st.success(f"Welcome, {username}! Please upload your documents.")
+        st.write("Please upload your documents for verification:")
         
-        # File uploaders
-        id_file = st.file_uploader("Upload ID Proof", type=['pdf'])
-        bank_file = st.file_uploader("Upload Bank Statement", type=['pdf'])
+        id_file = st.file_uploader("Upload ID Document (PDF)", type="pdf")
+        bank_file = st.file_uploader("Upload Bank Statement (PDF)", type="pdf")
         
         if id_file and bank_file:
-            # Save uploaded files temporarily
-            with open("temp_id.pdf", "wb") as f:
-                f.write(id_file.getvalue())
-            with open("temp_bank.pdf", "wb") as f:
-                f.write(bank_file.getvalue())
-            
-            if st.button("Verify Documents"):
-                with st.spinner("Processing documents..."):
-                    # Extract information from both documents
-                    id_info = asyncio.run(extract_document_info("temp_id.pdf"))
-                    bank_info = asyncio.run(extract_document_info("temp_bank.pdf"))
+            with st.spinner("Processing documents..."):
+                try:
+                    # Save and process files
+                    id_path = save_uploaded_file(id_file)
+                    bank_path = save_uploaded_file(bank_file)
                     
-                    # Compare extracted information
-                    is_verified, status_message = compare_extracted_info(id_info, bank_info)
+                    id_info = process_document(id_path, "id")
+                    bank_info = process_document(bank_path, "bank")
                     
-                    # Display results
-                    st.write("Extracted Information:")
+                    # Display extracted information
                     col1, col2 = st.columns(2)
                     with col1:
-                        st.write("ID Proof:")
-                        st.json(id_info)
-                    with col2:
-                        st.write("Bank Statement:")
-                        st.json(bank_info)
+                        st.subheader("ID Document Info")
+                        st.write(f"Name: {id_info['name']}")
+                        st.write(f"Phone: {id_info['phone']}")
+                        st.write(f"Address: {id_info['address']}")
                     
+                    with col2:
+                        st.subheader("Bank Statement Info")
+                        st.write(f"Name: {bank_info['name']}")
+                        st.write(f"Phone: {bank_info['phone']}")
+                        st.write(f"Address: {bank_info['address']}")
+                    
+                    # Compare and verify with detailed matching
+                    is_verified, matches, mismatches, match_details = compare_extracted_info(id_info, bank_info)
+                    
+                    st.subheader("Verification Results")
                     if is_verified:
                         st.success("Documents Verified Successfully!")
+                        status = "verified"
                     else:
-                        st.error("Verification Failed")
-                    
-                    st.write(status_message)
+                        st.error("Document Verification Failed")
+                        status = "not verified"
                     
                     # Update database
-                    verification_status = "verified" if is_verified else "not_verified"
-                    extracted_data = {
-                        "id_proof": id_info,
-                        "bank_statement": bank_info
-                    }
-                    asyncio.run(update_verification_result(username, verification_status, extracted_data))
-            
-            # Clean up temporary files
-            os.remove("temp_id.pdf")
-            os.remove("temp_bank.pdf")
+                    asyncio.run(update_verification_status(username, status))
+                    
+                    # Show detailed matching results
+                    st.subheader("Matching Details")
+                    for field in ['name', 'phone', 'address']:
+                        if field in match_details:
+                            icon = "✅" if field in matches else "❌"
+                            st.write(f"{icon} {field.title()}: {match_details[field]}")
+                    
+                finally:
+                    # Cleanup
+                    if 'id_path' in locals():
+                        os.remove(id_path)
+                    if 'bank_path' in locals():
+                        os.remove(bank_path)
 
 if __name__ == "__main__":
     main()
