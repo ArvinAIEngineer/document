@@ -1,4 +1,8 @@
 streamlit
-py-zerox
+asyncio
 asyncpg
 python-dotenv
+nanonets
+groq
+fuzzywuzzy
+PyPDF2
