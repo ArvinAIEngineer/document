@@ -67,6 +67,47 @@ async def update_verification_status(username: str, status: str):
     finally:
         await conn.close()
 
+async def get_user_record(username: str):
+    """Get user record from users table"""
+    conn = await connect_to_neon()
+    try:
+        result = await conn.fetchrow(
+            'SELECT * FROM users WHERE username = $1',
+            username
+        )
+        return result
+    finally:
+        await conn.close()
+
+async def create_or_update_user_record(username: str, name: str, phone: str, address: str):
+    """Create or update user record in users table"""
+    conn = await connect_to_neon()
+    try:
+        # Check if user exists
+        existing_user = await get_user_record(username)
+        
+        if existing_user:
+            # Update existing record
+            await conn.execute(
+                '''
+                UPDATE users 
+                SET name = $1, phone = $2, address = $3 
+                WHERE username = $4
+                ''',
+                name, phone, address, username
+            )
+        else:
+            # Create new record
+            await conn.execute(
+                '''
+                INSERT INTO users (username, name, phone, address)
+                VALUES ($1, $2, $3, $4)
+                ''',
+                username, name, phone, address
+            )
+    finally:
+        await conn.close()
+
 def save_uploaded_file(uploaded_file) -> str:
     """Save uploaded file to temp directory and return the path"""
     file_path = os.path.join("temp", uploaded_file.name)
@@ -220,7 +261,6 @@ def compare_extracted_info(id_info: Dict, bank_info: Dict) -> tuple:
     return is_verified, matches, mismatches, match_details
 
 def main():
-    
     username = st.text_input("Enter your username:")
     
     if username:
@@ -242,6 +282,15 @@ def main():
                     bank_path = save_uploaded_file(bank_file)
                     
                     id_info = process_document(id_path, "id")
+                    
+                    # Log ID document information to users table
+                    asyncio.run(create_or_update_user_record(
+                        username,
+                        id_info['name'],
+                        id_info['phone'],
+                        id_info['address']
+                    ))
+                    
                     bank_info = process_document(bank_path, "bank")
                     
                     # Display extracted information
